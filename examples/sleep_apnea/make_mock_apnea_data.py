@@ -2,25 +2,15 @@
 """Mock NCH and CHAT sleep studies, for NCHSleepDataset and CHATDataset.
 
 What it shows: the on-disk layout that :class:`~pyhealth.datasets.NCHSleepDataset`
-and :class:`~pyhealth.datasets.CHATDataset` read, as synthetic sleep studies,
-and the arrays that the apnea-missing-modality code
-(github.com/healthylaife/apnea-missing-modality) derives from them.
+and :class:`~pyhealth.datasets.CHATDataset` read, filled with synthetic sleep
+studies that :class:`~pyhealth.tasks.SleepApneaDetection` can run on.
 
 Dataset: none needed. It writes stand-ins for the NSRR NCH Sleep DataBank and
 CHAT, which are restricted (approved NSRR data request). Nothing is
-downloaded. Three stages are written under ``--out``:
-
-  raw/            what NSRR ships: EDFs, NCH ``.tsv`` annotations, CHAT
-                  ``*-nsrr.xml`` annotations, and the health/subject CSVs
-  preprocessed/   what apnea-missing-modality's data/{nch,chat}/preprocessing.py
-                  writes (one .npz per study: 30 s epochs, wake removed)
-  folds/          what its data/{nch,chat}/dataloader.py writes and
-                  missing_modality/train_test.py reads
-                  (<name>_<fold>.npz with x / y_apnea / y_hypopnea)
-
-Stages 2 and 3 are computed by running a port of that preprocessing and
-dataloader code over the stage-1 files with mne and scipy, so the three stages
-are consistent with each other.
+downloaded. Under ``--out`` it writes ``raw/nchsdb`` (EDFs, ``.tsv``
+annotations, ``health_data/`` CSVs) and ``raw/chat`` (EDFs, NSRR XML
+annotations, subject CSVs), plus ``manifest.json`` with the events placed in
+every study.
 
 The signals are synthetic but respond to the annotated events the way real
 signals do: airflow drops during apneas and hypopneas, breathing effort stops
@@ -31,12 +21,12 @@ something from them, which makes them usable as a smoke test.
 How to run, from the PyHealth repo root with PyHealth installed:
 
     python examples/sleep_apnea/make_mock_apnea_data.py
-    python examples/sleep_apnea/make_mock_apnea_data.py --minutes 6 \\
+    python examples/sleep_apnea/make_mock_apnea_data.py --minutes 6 \
         --out examples/sleep_apnea/tiny
 
-The first writes ``examples/sleep_apnea/out`` (about 375 MB), the second a
-smaller set. Then point ``NCHSleepDataset`` at ``out/raw/nchsdb`` and
-``CHATDataset`` at ``out/raw/chat``.
+The first writes ``examples/sleep_apnea/out``, the second a smaller set. Then
+point ``NCHSleepDataset`` at ``out/raw/nchsdb`` and ``CHATDataset`` at
+``out/raw/chat``.
 """
 
 from __future__ import annotations
@@ -48,13 +38,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import mne
 import numpy as np
 import pandas as pd
 from scipy import signal as sps
-from scipy.interpolate import splev, splrep
-
-mne.set_log_level("ERROR")
 
 EPOCH_SEC = 30
 NCH_STAGE = {
@@ -104,8 +90,8 @@ class StudySpec:
 
 def nch_specs() -> list[StudySpec]:
     # 8 patients / 10 studies. Two patients have repeat studies, one study has
-    # no events (fails the AHI >= 3 filter), one lacks Capno (fails the channel
-    # check). That leaves 6 patients for the 5 folds.
+    # no events (left out by SleepApneaDetection(min_ahi=3)), one lacks Capno
+    # (skipped by the task unless fill_missing=True).
     rows = [
         ("10012", "21037", 18, 256, (), 2900, 1, ""),
         ("10012", "24410", 11, 256, (), 3650, 1, "repeat study"),
@@ -115,8 +101,8 @@ def nch_specs() -> list[StudySpec]:
         ("10071", "25871", 14, 256, (), 2600, 0, "repeat study"),
         ("10088", "22213", 9, 256, (), 5400, 1, ""),
         ("10093", "22540", 40, 256, (), 1100, 0, ""),
-        ("10104", "23016", 0, 256, (), 3300, 1, "no events -> skipped (low AHI)"),
-        ("10117", "23377", 20, 256, ("Capno",), 4100, 0, "no Capno -> skipped"),
+        ("10104", "23016", 0, 256, (), 3300, 1, "no events (AHI 0)"),
+        ("10117", "23377", 20, 256, ("Capno",), 4100, 0, "no Capno channel"),
     ]
     return [
         StudySpec("nch", f"{p}_{s}", p, a, fs, d, age, m, n)
@@ -132,15 +118,15 @@ def chat_specs() -> list[StudySpec]:
         (300004, 15, 200, (), 8, 0, ""),
         (300005, 6, 200, (), 9, 1, ""),
         (300006, 27, 200, (), 6, 0, ""),
-        (300007, 0, 200, (), 7, 1, "no events -> skipped"),
-        (300008, 18, 200, ("Cap",), 5, 0, "no Cap -> skipped"),
+        (300007, 0, 200, (), 7, 1, "no events (AHI 0)"),
+        (300008, 18, 200, ("Cap",), 5, 0, "no Cap channel"),
     ]
     specs = [
         StudySpec("chat", f"chat-baseline-{i}", str(i), a, fs, d, age * 365, m, n)
         for i, a, fs, d, age, m, n in rows
     ]
-    # Follow-up visits (about 7 months later) for two subjects. They have XML
-    # annotations only, and the original pipeline ignores them (baseline only).
+    # Follow-up visits (about 7 months later) for two subjects, with XML
+    # annotations only.
     specs += [
         StudySpec(
             "chat",
@@ -659,12 +645,13 @@ def write_raw(out: Path, minutes: int, seed: int) -> dict[str, list[Study]]:
                 len(study.stages) * EPOCH_SEC,
             )
             if spec.visit == "baseline":
-                # The original preprocessing reads a TSV next to the EDF.
+                # apnea-missing-modality reads a TSV next to the EDF;
+                # CHATDataset reads the XML when both are there.
                 ann.to_csv(f"{stem}-nsrr.tsv", sep="\t", index=False)
         study.start = start
         studies[spec.dataset].append(study)
 
-    # ---- NCH health data + AHI table (the original reads D:\Data\AHI.csv)
+    # ---- NCH health data
     nch = studies["nch"]
     pd.DataFrame(
         {
@@ -696,9 +683,6 @@ def write_raw(out: Path, minutes: int, seed: int) -> dict[str, list[Study]]:
             "ETHNICITY_DESCR": ["Unknown"] * len(first),
         }
     ).to_csv(nch_dir / "health_data" / "DEMOGRAPHIC.csv", index=False)
-    pd.DataFrame(
-        {"Study": [s.spec.name for s in nch], "AHI": [round(s.ahi, 2) for s in nch]}
-    ).to_csv(nch_dir / "AHI.csv", index=False)
 
     for visit in ("baseline", "followup"):
         chat = [s for s in studies["chat"] if s.spec.visit == visit]
@@ -712,320 +696,6 @@ def write_raw(out: Path, minutes: int, seed: int) -> dict[str, list[Study]]:
             }
         ).to_csv(chat_dir / "datasets" / f"chat-{visit}-dataset-mock.csv", index=False)
     return studies
-
-
-# ====================================== stage 2: port of preprocessing.py
-NCH_PRE = {
-    "freq": 64.0,
-    "channels": [
-        "EOG LOC-M2",
-        "EOG ROC-M1",
-        "EEG C3-M2",
-        "EEG C4-M1",
-        "ECG EKG2-EKG",
-        "RESP PTAF",
-        "RESP AIRFLOW",
-        "RESP THORACIC",
-        "RESP ABDOMINAL",
-        "SPO2",
-        "CAPNO",
-    ],
-    "apnea": {
-        k: 2
-        for k in [
-            "Obstructive Apnea",
-            "Central Apnea",
-            "Mixed Apnea",
-            "apnea",
-            "obstructive apnea",
-            "central apnea",
-            "Apnea",
-        ]
-    },
-    "hypopnea": {
-        k: 1
-        for k in [
-            "Obstructive Hypopnea",
-            "Hypopnea",
-            "hypopnea",
-            "Mixed Hypopnea",
-            "Central Hypopnea",
-        ]
-    },
-    "wake": {"Sleep stage W": 10},
-}
-CHAT_PRE = {
-    "freq": 128.0,
-    "channels": [
-        "E1",
-        "E2",
-        "F3",
-        "F4",
-        "C3",
-        "C4",
-        "M1",
-        "M2",
-        "O1",
-        "O2",
-        "ECG1",
-        "ECG3",
-        "CANNULAFLOW",
-        "AIRFLOW",
-        "CHEST",
-        "ABD",
-        "SAO2",
-        "CAP",
-    ],
-    "apnea": {"Obstructive apnea": 2, "Central apnea": 2},
-    "hypopnea": {"Hypopnea": 1},
-    "wake": {"Wake": 10},
-}
-
-
-def _second_set(raw, event_id):
-    try:
-        ev, _ = mne.events_from_annotations(raw, event_id=event_id, chunk_duration=1.0)
-    except ValueError:
-        return None
-    return set(((ev[:, 0] - raw.first_samp) / raw.info["sfreq"]).astype(int))
-
-
-def preprocess_study(edf: Path, tsv: Path, cfg: dict, ahi: float | None):
-    """Returns (data, labels_apnea, labels_hypopnea) or a skip reason string."""
-    raw = mne.io.read_raw_edf(edf, preload=True)
-    df = pd.read_csv(tsv, sep="\t")
-    raw.set_annotations(mne.Annotations(df.onset, df.duration, df.description))
-    raw.rename_channels({c: c.upper() for c in raw.ch_names})
-
-    if not all(c in raw.ch_names for c in cfg["channels"]):
-        return "insufficient channels"
-    if ahi is not None and ahi < 3:
-        return f"low AHI ({ahi})"
-    if _second_set(raw, {**cfg["apnea"], **cfg["hypopnea"]}) is None:
-        return "no respiratory events"
-    apnea = _second_set(raw, cfg["apnea"]) or set()
-    hypopnea = _second_set(raw, cfg["hypopnea"]) or set()
-    wake = _second_set(raw, cfg["wake"]) or set()
-
-    sfreq = raw.info["sfreq"]
-    raw.pick(cfg["channels"]).reorder_channels(cfg["channels"])
-    events = mne.make_fixed_length_events(raw, id=0, duration=EPOCH_SEC, overlap=0.0)
-    epochs = mne.Epochs(
-        raw,
-        events,
-        event_id=[0],
-        tmin=0,
-        tmax=EPOCH_SEC - 1.0 / sfreq,
-        baseline=None,
-        preload=True,
-        proj=False,
-    )
-    # Epoch start seconds are read before resampling, using the original rate.
-    starts = ((epochs.events[:, 0] - raw.first_samp) / sfreq).astype(int)
-    if sfreq != cfg["freq"]:
-        epochs = epochs.resample(cfg["freq"], npad="auto")
-    data = epochs.get_data()
-
-    la, lh, keep = [], [], []
-    for s in starts:
-        sec = set(range(s, s + EPOCH_SEC))
-        la.append(len(apnea & sec))
-        lh.append(len(hypopnea & sec))
-        keep.append(len(wake & sec) == 0)
-    keep = np.array(keep)
-    return data[keep], np.array(la)[keep], np.array(lh)[keep]
-
-
-def chat_rereference(data: np.ndarray) -> np.ndarray:
-    d = data
-    return np.stack(
-        [
-            d[:, 0] - d[:, 7],
-            d[:, 1] - d[:, 6],  # E1-M2, E2-M1
-            d[:, 2] - d[:, 7],
-            d[:, 3] - d[:, 6],  # F3-M2, F4-M1
-            d[:, 4] - d[:, 7],
-            d[:, 5] - d[:, 6],  # C3-M2, C4-M1
-            d[:, 8] - d[:, 7],
-            d[:, 9] - d[:, 6],  # O1-M2, O2-M1
-            d[:, 10] - d[:, 11],  # ECG1-ECG3
-            d[:, 12],
-            d[:, 13],
-            d[:, 14],
-            d[:, 15],  # CANNULAFLOW AIRFLOW CHEST ABD
-            d[:, 16],
-            d[:, 17],  # SAO2 CAP
-        ],
-        axis=1,
-    )
-
-
-def write_preprocessed(out: Path, studies: dict[str, list[Study]]) -> dict:
-    report = {}
-    nch_out = out / "preprocessed" / "nch_30x64"
-    chat_out = out / "preprocessed" / "chat_b_30x64"
-    nch_out.mkdir(parents=True)
-    chat_out.mkdir(parents=True)
-    for study in studies["nch"] + studies["chat"]:
-        spec = study.spec
-        if spec.visit != "baseline":
-            continue  # the original pipeline reads CHAT baseline studies only
-        if spec.dataset == "nch":
-            stem = out / "raw" / "nchsdb" / "sleep_data" / spec.name
-            res = preprocess_study(
-                stem.with_suffix(".edf"),
-                stem.with_suffix(".tsv"),
-                NCH_PRE,
-                round(study.ahi, 2),
-            )
-        else:
-            stem = (
-                out
-                / "raw"
-                / "chat"
-                / "polysomnography"
-                / "edfs"
-                / "baseline"
-                / spec.name
-            )
-            res = preprocess_study(
-                stem.with_suffix(".edf"), Path(f"{stem}-nsrr.tsv"), CHAT_PRE, None
-            )
-        if isinstance(res, str):
-            report[spec.name] = {"skipped": res}
-            continue
-        data, la, lh = res
-        if spec.dataset == "nch":
-            fname = nch_out / f"{spec.name}_{la.sum()}_{lh.sum()}.npz"
-        else:
-            data = chat_rereference(data)
-            fname = chat_out / f"{spec.name}.edf_{la.sum()}_{lh.sum()}.npz"
-        np.savez_compressed(fname, data=data, labels_apnea=la, labels_hypopnea=lh)
-        report[spec.name] = {
-            "file": fname.name,
-            "shape": list(data.shape),
-            "epochs_with_event": int(((la + lh) > 0).sum()),
-        }
-    return report
-
-
-# ======================================== stage 3: port of dataloader.py
-def extract_rri(ecg: np.ndarray, fs: int, band_hi: float):
-    """R-R interval and R-peak amplitude, interpolated onto the epoch grid.
-
-    The original uses biosppy's hamilton_segmenter. This uses a FIR band-pass
-    filter plus scipy.signal.find_peaks, which is close enough for mock data.
-    """
-    n = len(ecg)
-    tm = np.arange(n) / fs
-    taps = sps.firwin(int(0.3 * fs) | 1, [3, band_hi], pass_zero=False, fs=fs)
-    filt = sps.filtfilt(taps, [1.0], ecg)
-    peaks, _ = sps.find_peaks(
-        filt, distance=int(0.3 * fs), height=0.4 * np.percentile(filt, 99.5)
-    )
-    if not 4 < len(peaks) < 200:
-        return np.zeros(n), np.zeros(n), False
-    rri = splev(tm, splrep(peaks[1:] / fs, np.diff(peaks) / fs, k=3), ext=1)
-    amp = splev(tm, splrep(peaks / fs, ecg[peaks], k=3), ext=1)
-    return rri, amp, True
-
-
-def _balance(la, lh, rng):
-    y = la + lh
-    neg, pos = np.flatnonzero(y == 0), np.flatnonzero(y > 0)
-    ratio = len(pos) / max(len(neg), 1)
-    return np.concatenate([neg[rng.random(len(neg)) < ratio], pos]).astype(int)
-
-
-def build_fold_arrays(
-    files: list[Path], sigs, ecg_idx, in_fs, rri_band, rri_scale, rng
-):
-    out_len = EPOCH_SEC * 64
-    xs, yas, yhs = [], [], []
-    for f in files:
-        z = np.load(f)
-        idx = _balance(z["labels_apnea"], z["labels_hypopnea"], rng)
-        signals = z["data"][idx]
-        x = np.zeros((len(idx), out_len, len(sigs) + 2))
-        for i in range(len(idx)):
-            rri, amp, _ = extract_rri(signals[i, ecg_idx], in_fs, rri_band)
-            rri, amp = rri_scale(rri, amp)
-            x[i, :, -1] = sps.resample(rri, out_len) if len(rri) != out_len else rri
-            x[i, :, -2] = sps.resample(amp, out_len) if len(amp) != out_len else amp
-            for j, s in enumerate(sigs):
-                sig = signals[i, s]
-                x[i, :, j] = sps.resample(sig, out_len) if len(sig) != out_len else sig
-        xs.append(x)
-        yas.append(z["labels_apnea"][idx])
-        yhs.append(z["labels_hypopnea"][idx])
-    return np.concatenate(xs), np.concatenate(yas), np.concatenate(yhs)
-
-
-def write_folds(out: Path, seed: int) -> dict:
-    rng = np.random.default_rng(seed)
-    fold_dir = out / "folds"
-    fold_dir.mkdir()
-    report = {}
-
-    # ---- NCH: drop AHI <= 3, group studies by patient, and deal the
-    # patients, sorted by event count, into the folds
-
-    ahi = pd.read_csv(out / "raw" / "nchsdb" / "AHI.csv")
-    ahi = dict(zip(ahi.Study, ahi.AHI))
-    pre = out / "preprocessed" / "nch_30x64"
-    counts: dict[str, int] = {}
-    for f in sorted(pre.glob("*.npz")):
-        pat, stu, a, h = f.stem.split("_")
-        if ahi.get(f"{pat}_{stu}", 0) > 3:
-            counts[pat] = counts.get(pat, 0) + int(a) + int(h)
-    patients = [p for p, _ in sorted(counts.items(), key=lambda kv: kv[1])]
-    for k in range(5):
-        fold_pats = patients[k::5]
-        files = [f for p in fold_pats for f in sorted(pre.glob(f"{p}_*.npz"))]
-        x, ya, yh = build_fold_arrays(
-            files,
-            sigs=[0, 3, 5, 6, 9, 10, 4],
-            ecg_idx=4,
-            in_fs=64,
-            rri_band=31,
-            rri_scale=lambda r, a: (np.clip(r, 0, 2), np.clip(a, -0.001, 0.002)),
-            rng=rng,
-        )
-        np.savez_compressed(
-            fold_dir / f"nch_30x64_{k}.npz", x=x, y_apnea=ya, y_hypopnea=yh
-        )
-        report[f"nch_30x64_{k}.npz"] = {
-            "patients": fold_pats,
-            "x": list(x.shape),
-            "positive": int((np.sign(ya + yh) > 0).sum()),
-        }
-
-    # ---- CHAT: deal studies round-robin
-    pre = out / "preprocessed" / "chat_b_30x64"
-    files = sorted(pre.glob("*.npz"))
-    for k in range(5):
-        fold_files = files[k::5]
-        x, ya, yh = build_fold_arrays(
-            fold_files,
-            sigs=[0, 5, 9, 10, 13, 14, 8],
-            ecg_idx=8,
-            in_fs=128,
-            rri_band=45,
-            rri_scale=lambda r, a: (
-                np.clip(r, 0, 2) * 100,
-                np.clip(a, -0.001, 0.002) * 10000,
-            ),
-            rng=rng,
-        )
-        np.savez_compressed(
-            fold_dir / f"chat_b_30x64_{k}.npz", x=x, y_apnea=ya, y_hypopnea=yh
-        )
-        report[f"chat_b_30x64_{k}.npz"] = {
-            "studies": [f.name.split(".")[0] for f in fold_files],
-            "x": list(x.shape),
-            "positive": int((np.sign(ya + yh) > 0).sum()),
-        }
-    return report
 
 
 # =============================================================== main
@@ -1066,14 +736,7 @@ def main():
             for s in studies["nch"] + studies["chat"]
         },
     }
-    manifest["preprocessed"] = write_preprocessed(args.out, studies)
-    manifest["folds"] = write_folds(args.out, args.seed)
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2))
-
-    for name, info in manifest["preprocessed"].items():
-        print(f"{name:24s} {info}")
-    for name, info in manifest["folds"].items():
-        print(f"{name:22s} {info}")
     size = sum(f.stat().st_size for f in args.out.rglob("*") if f.is_file()) / 1e6
     print(f"wrote {args.out} ({size:.0f} MB)")
 

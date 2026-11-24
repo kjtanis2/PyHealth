@@ -1,4 +1,4 @@
-"""CHATDataset metadata, on small synthetic EDF and annotation files."""
+"""CHATDataset, on small synthetic EDF and annotation files."""
 
 import tempfile
 import unittest
@@ -10,6 +10,7 @@ import pandas as pd
 from pyhealth.datasets import CHATDataset
 from pyhealth.datasets.chat import read_chat_annotations, summarize_chat_annotations
 from pyhealth.datasets.metadata_csv import resolve_metadata_root
+from pyhealth.tasks import SleepApneaDetection
 from tests.core.psg_test_utils import write_edf, write_tsv
 
 SFREQ = 8
@@ -370,21 +371,44 @@ class TestCHATMetadata(_TempDir):
         self.assertIn("duration", logs.output[0])
 
 
-class TestCHATEndToEnd(_TempDir):
-    def test_patients_and_study_events(self):
-        _write_dataset(self.root)
+class TestCHATEndToEnd(unittest.TestCase):
+    """Loads the dataset once for all tests: loading starts worker processes."""
 
-        dataset = CHATDataset(
-            root=str(self.root), cache_dir=str(self.root.parent / "cache")
+    @classmethod
+    def setUpClass(cls):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.addClassCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "chat"
+        _write_dataset(root)
+        cls.dataset = CHATDataset(
+            root=str(root), cache_dir=str(Path(tmp.name) / "cache")
         )
 
-        self.assertEqual(sorted(dataset.unique_patient_ids), ["300001", "300002"])
-        studies = dataset.get_patient("300001").get_events("studies")
+    def test_patients_and_study_events(self):
+        self.assertEqual(sorted(self.dataset.unique_patient_ids), ["300001", "300002"])
+        studies = self.dataset.get_patient("300001").get_events("studies")
         self.assertEqual(sorted(s.visit for s in studies), ["baseline", "followup"])
         followup = next(s for s in studies if s.visit == "followup")
         self.assertEqual(followup.record_id, "chat-followup-300001")
         self.assertTrue(Path(followup.signal_file).is_file())
         self.assertAlmostEqual(float(followup.ahi), 60.0)
+
+    def test_task_reads_both_visits_and_rereferences_electrodes(self):
+        self.assertIsInstance(self.dataset.default_task, SleepApneaDetection)
+        task = SleepApneaDetection(
+            modalities=["eeg", "resp", "spo2"], sampling_rate=SFREQ
+        )
+
+        samples = task(self.dataset.get_patient("300001"))
+
+        # Baseline: 3 sleep windows, each with an event. Follow-up: a window
+        # with a hypopnea and one without events; wake windows are dropped.
+        self.assertEqual(
+            [(s["record_id"], s["label"]) for s in samples],
+            [("chat-baseline-300001", 1)] * 3
+            + [("chat-followup-300001", 1), ("chat-followup-300001", 0)],
+        )
+        self.assertEqual(samples[0]["signal"].shape, (3, 30 * SFREQ))
 
 
 if __name__ == "__main__":

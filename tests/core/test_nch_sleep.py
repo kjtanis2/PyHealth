@@ -1,4 +1,4 @@
-"""NCHSleepDataset metadata, on small synthetic EDF and annotation files."""
+"""NCHSleepDataset, on small synthetic EDF and annotation files."""
 
 import tempfile
 import unittest
@@ -13,6 +13,7 @@ from pyhealth.datasets.nch_sleep import (
     read_nch_annotations,
     summarize_nch_annotations,
 )
+from pyhealth.tasks import SleepApneaDetection
 from tests.core.psg_test_utils import write_edf
 from tests.core.psg_test_utils import write_tsv as _write_tsv
 
@@ -308,16 +309,24 @@ class TestNCHMetadata(_TempDir):
         self.assertTrue(metadata_root.is_relative_to(home))
 
 
-class TestNCHEndToEnd(_TempDir):
-    def test_patients_and_study_events(self):
-        _write_dataset(self.root)
+class TestNCHEndToEnd(unittest.TestCase):
+    """Loads the dataset once for all tests: loading starts worker processes."""
 
-        dataset = NCHSleepDataset(
-            root=str(self.root), cache_dir=str(self.root.parent / "cache")
+    @classmethod
+    def setUpClass(cls):
+        # ignore_cleanup_errors: on Windows, set_task's cache files can still
+        # be open when the folder is removed.
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.addClassCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "nchsdb"
+        _write_dataset(root, studies={**STUDIES, "999_1": STUDIES["25_3"]})
+        cls.dataset = NCHSleepDataset(
+            root=str(root), cache_dir=str(Path(tmp.name) / "cache")
         )
 
-        self.assertEqual(sorted(dataset.unique_patient_ids), ["100", "25"])
-        studies = dataset.get_patient("100").get_events("studies")
+    def test_patients_and_study_events(self):
+        self.assertEqual(sorted(self.dataset.unique_patient_ids), ["100", "25", "999"])
+        studies = self.dataset.get_patient("100").get_events("studies")
         self.assertEqual([s.record_id for s in studies], ["100_7", "100_12"])
         self.assertEqual(
             [str(s.timestamp) for s in studies],
@@ -327,15 +336,25 @@ class TestNCHEndToEnd(_TempDir):
         self.assertAlmostEqual(float(studies[1].ahi), 120.0)
 
     def test_study_without_start_time_loads_with_empty_timestamp(self):
-        _write_dataset(self.root, studies={**STUDIES, "999_1": STUDIES["25_3"]})
-
-        dataset = NCHSleepDataset(
-            root=str(self.root), cache_dir=str(self.root.parent / "cache")
-        )
-
-        (study,) = dataset.get_patient("999").get_events("studies")
+        (study,) = self.dataset.get_patient("999").get_events("studies")
         self.assertEqual(study.record_id, "999_1")
         self.assertTrue(pd.isna(study.timestamp))
+
+    def test_default_task_is_apnea_detection(self):
+        self.assertIsInstance(self.dataset.default_task, SleepApneaDetection)
+
+    def test_set_task_builds_labelled_windows(self):
+        task = SleepApneaDetection(
+            modalities=["eeg", "resp", "spo2"], sampling_rate=SFREQ
+        )
+
+        samples = self.dataset.set_task(task)
+
+        # 100_7: 3 sleep windows with events; 100_12: 1; 25_3 and 999_1: 2
+        # sleep windows each, without events. Wake windows are dropped.
+        self.assertEqual(len(samples), 8)
+        self.assertEqual(sorted(int(s["label"]) for s in samples), [0] * 4 + [1] * 4)
+        self.assertEqual(tuple(samples[0]["signal"].shape), (3, 30 * SFREQ))
 
 
 if __name__ == "__main__":

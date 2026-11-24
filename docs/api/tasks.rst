@@ -264,6 +264,7 @@ Available Tasks
     IIIC Seizure Classification <tasks/pyhealth.tasks.iiic_seizure_classification>
     EEGBCI Tasks <tasks/pyhealth.tasks.eegbci>
     AHEPA Dementia Classification <tasks/pyhealth.tasks.DementiaClassificationAHEPA>
+    Sleep Apnea Detection (NCH, CHAT) <tasks/pyhealth.tasks.SleepApneaDetection>
     BCI Competition IV 2a Motor Imagery <tasks/pyhealth.tasks.BCIIV2aMotorImageryClassification>
     BCI Competition IV 2a Left vs Right Hand <tasks/pyhealth.tasks.BCIIV2aLeftRightImagery>
     PTB-XL Tasks <tasks/pyhealth.tasks.ptbxl>

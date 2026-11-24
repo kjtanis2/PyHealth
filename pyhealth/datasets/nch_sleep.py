@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from pyhealth.tasks import SleepApneaDetection
+
 from .base_dataset import BaseDataset
 from .metadata_csv import (
     metadata_csv_exists,
@@ -335,6 +337,16 @@ class NCHSleepDataset(BaseDataset):
 
         df = self._join_health_data(pd.DataFrame(rows), _subdir(root, "health_data"))
         write_metadata_csv(df, root, _NAME, _CSV_NAME)
+
+    @property
+    def default_task(self) -> SleepApneaDetection:
+        """Return the default sleep apnea detection task.
+
+        Returns:
+            A :class:`~pyhealth.tasks.SleepApneaDetection` on 30 second
+            windows at 64 Hz with all modalities, keeping every study.
+        """
+        return SleepApneaDetection()
 
     @staticmethod
     def _join_health_data(studies: pd.DataFrame, health_data: Path) -> pd.DataFrame:

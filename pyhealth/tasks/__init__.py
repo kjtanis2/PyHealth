@@ -246,6 +246,7 @@ from .sleep_staging_ear_eeg import (
 from .dementia_classification_ahepa import (
     DementiaClassificationAHEPA as DementiaClassificationAHEPA,
 )
+from .sleep_apnea_detection import SleepApneaDetection as SleepApneaDetection
 from .soz_localization_hup import (
     SOZLocalizationHUP as SOZLocalizationHUP,
 )
